@@ -1,0 +1,136 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: This template if for hostig static website with lambda@Edge
+Parameters:
+  webbucketname:
+    Description: name of the s3 bucket
+    Type: String
+    Default: mytestyogeshweb
+Resources:
+  S3BucketForWebsiteContent:
+    Type: AWS::S3::Bucket
+    Properties:
+      AccessControl: Private
+      BucketName: !Ref webbucketname
+      VersioningConfiguration:
+        Status: Enabled
+      Tags:
+        - Key: key
+          Value: value
+      PublicAccessBlockConfiguration:
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRole
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+                - edgelambda.amazonaws.com
+      Policies:
+        - PolicyName: LambdaExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+              - Effect: Allow
+                Action: lambda:GetFunction
+                Resource: '*'
+  lambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: This Lambda function is for authenticate the static website
+      FunctionName: CDNWebAuthenticationLambda
+      Handler: index.handler
+      MemorySize: 128
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: nodejs16.x
+      Timeout: 5
+      Code:
+        ZipFile: |
+          'use strict';
+          exports.handler = (event, context, callback) => {
+              // Get request and request headers
+              const request = event.Records[0].cf.request;
+              const headers = request.headers;
+              // Configure authentication
+              const authUser = 'YOUR USERNAME';
+              const authPass = 'YOUR PASWORD';
+              // Construct the Basic Auth string
+              const authString = 'Basic ' + new Buffer(authUser + ':' + authPass).toString('base64');
+              // Require Basic authentication
+              if (typeof headers.authorization == 'undefined' || headers.authorization[0].value != authString) {
+                  const body = 'Unauthorized';
+                  const response = {
+                      status: '401',
+                      statusDescription: 'Unauthorized',
+                      body: body,
+                      headers: {
+                          'www-authenticate': [{key: 'WWW-Authenticate', value:'Basic'}]
+                      },
+                  };
+                  callback(null, response);
+              }
+              // Continue request processing if authentication passed
+              callback(null, request);
+          };
+  PublishLambdaVersion:
+    Type: AWS::Lambda::Version
+    Properties:
+      FunctionName: !GetAtt lambdaFunction.Arn
+  lambdapermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt lambdaFunction.Arn
+      Principal: cloudfront.amazonaws.com
+  WebsiteCDNOriginAccessIdentity:
+    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: Ristrict-to-s3-only
+  WebsiteCDN:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: CDN for S3-backed website
+        Enabled: true
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ForwardedValues:
+            QueryString: false
+          ViewerProtocolPolicy: redirect-to-https
+          LambdaFunctionAssociations:
+            - EventType: viewer-request
+              LambdaFunctionARN: !Sub ${lambdaFunction.Arn}:3
+        DefaultRootObject: index.html
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+          MinimumProtocolVersion: TLSv1.1_2016
+        Origins:
+          - DomainName: !GetAtt S3BucketForWebsiteContent.RegionalDomainName
+            Id: S3Origin
+            S3OriginConfig:
+              OriginAccessIdentity: !Sub origin-access-identity/cloudfront/${WebsiteCDNOriginAccessIdentity}
+  CDNBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref S3BucketForWebsiteContent
+      PolicyDocument:
+        Statement:
+          - Sid: AllowCloudFrontAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::cloudfront:user/CloudFront Origin Access Identity ${WebsiteCDNOriginAccessIdentity}
+            Action: s3:GetObject
+            Resource: !Sub arn:aws:s3:::${S3BucketForWebsiteContent}/*
